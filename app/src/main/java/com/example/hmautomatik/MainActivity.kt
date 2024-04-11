@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -21,19 +20,12 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.*
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
@@ -53,17 +45,13 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
-
     private lateinit var logEntryDao: LogEntryDao
-
     companion object {
         private const val SMS_PERMISSION_CODE = 102
     }
-
     private lateinit var sharedPreferences: SharedPreferences
-
-    private lateinit var retryService: RetryService
-
+    private val handler = Handler(Looper.getMainLooper())
+    private lateinit var collectSmsRunnable: Runnable
     @RequiresApi(Build.VERSION_CODES.O)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,10 +61,7 @@ class MainActivity : ComponentActivity() {
         wakeLock.acquire()
         logEntryDao = database.logEntryDao()
         val failedMessageLogsDao = database.failedMessagesLogsDao()
-        val retryLogsDao = database.retryLogsDao()
         sharedPreferences = getSharedPreferences("AppSettings", MODE_PRIVATE)
-        retryService = RetryService(this)
-        retryService.start()
         startService(Intent(this, InternetCheckService::class.java))
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -97,54 +82,44 @@ class MainActivity : ComponentActivity() {
                     MainScreen(
                         logEntryDao.getAllLogsFlow(),
                         failedMessageLogsDao.getAllLogsFlow(),
-                        retryLogsDao.getAllLogsFlow()
                     ) {
                         CoroutineScope(Dispatchers.IO).launch {
                             logEntryDao.deleteAllLogs()
                             failedMessageLogsDao.deleteAllLogs()
-                            retryLogsDao.deleteAllLogs()
                         }
                     }
                 }
             }
         }
 
-
-
-        val serviceIntent = Intent(this, MyForegroundService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val intent = Intent()
-            val packageName = packageName
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                intent.action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                intent.data = Uri.parse("package:$packageName")
-                startActivity(intent)
-            }
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
-        }
         checkAndRequestPermissions()
+        initCollectSmsRunnable()
+        handler.post(collectSmsRunnable)
+    }
+
+    private fun initCollectSmsRunnable() {
+        collectSmsRunnable = object : Runnable {
+            override fun run() {
+                if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) {
+                    collectAndLogSms(this@MainActivity)
+                } else {
+                    Log.d("MainActivity", "Необходимо разрешение на чтение SMS.")
+                }
+                handler.postDelayed(this, 5000)
+            }
+        }
     }
 
     @Composable
     fun MainScreen(
         logEntriesFlow: Flow<List<LogEntry>>,
         failedMessagesFlow: Flow<List<FailedMessagesLogs>>,
-        retryLogsFlow: Flow<List<RetryLogs>>,
         onClearLogs: () -> Unit
     ) {
-        val defaultEncryptionKey = "123123123"
-        val defaultApiUrl = "https://api.moneyhoney.io/api/v1/payment/auto"
-        var encryptionKey by remember { mutableStateOf(sharedPreferences.getString("encryptionKey", defaultEncryptionKey) ?: defaultEncryptionKey) }
-        var url by remember { mutableStateOf(sharedPreferences.getString("apiUrl", defaultApiUrl) ?: defaultApiUrl) }
-        val savedPhoneNumberList = sharedPreferences.getString("phoneNumberList", "") ?: ""
-        val phoneNumberList = remember { mutableStateListOf(*savedPhoneNumberList.split(",").filter { it.isNotEmpty() }.toTypedArray()) }
-        var newPhoneNumber by remember { mutableStateOf("") }
-        var retryCount by remember { mutableStateOf(sharedPreferences.getString("retryCount", "") ?: "") }
+        val defaultReceiver = "+79990000001"
+        var receiver by remember { mutableStateOf(sharedPreferences.getString("receiver", defaultReceiver) ?: defaultReceiver) }
         var selectedTabIndex by remember { mutableStateOf(0) }
-        val tabTitles = listOf("Success", "Failed", "Retry")
+        val tabTitles = listOf("Success", "Failed")
         val isInternetAvailable by InternetCheckService.internetAvailable.collectAsState()
         var offlineDurationText by remember { mutableStateOf("") }
         val coroutineScope = rememberCoroutineScope()
@@ -174,78 +149,16 @@ class MainActivity : ComponentActivity() {
             if (!isInternetAvailable && offlineDurationText.isNotEmpty()) {
                 Text(text = offlineDurationText, color = Color.Red)
             }
+
             OutlinedTextField(
-                value = encryptionKey,
+                value = receiver,
                 onValueChange = { newValue ->
-                    encryptionKey = newValue
-                    sharedPreferences.edit().putString("encryptionKey", newValue.ifEmpty { defaultEncryptionKey }).apply()
+                    receiver = newValue
+                    sharedPreferences.edit().putString("receiver", newValue.ifEmpty { defaultReceiver }).apply()
                 },
-                label = { Text("Ключ шифрования") }
+                label = { Text("Абонент") }
             )
 
-            OutlinedTextField(
-                value = url,
-                onValueChange = { newUrl ->
-                    url = newUrl
-                    val toSave = if (newUrl.isBlank()) defaultApiUrl else newUrl
-                    sharedPreferences.edit().putString("apiUrl", toSave).apply()
-                },
-                label = { Text("URL для отправки сообщения") }
-            )
-
-            Row(
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                OutlinedTextField(
-                    value = newPhoneNumber,
-                    onValueChange = { newPhoneNumber = it },
-                    label = { Text("Добавить номер телефона") }
-                )
-                IconButton(onClick = {
-                    if (newPhoneNumber.isNotBlank()) {
-                        phoneNumberList.add(newPhoneNumber)
-                        updateSharedPreferences(phoneNumberList)
-                        newPhoneNumber = ""
-                        Log.d("MainActivity", "Номер добавлен: $newPhoneNumber")
-                        Log.d("MainActivity", "Сохраненные номера: ${phoneNumberList.joinToString()}")
-                    }
-                }) {
-                    Icon(Icons.Filled.Add, contentDescription = "Добавить")
-                }
-            }
-
-            phoneNumberList.forEach { phoneNumber ->
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text(
-                        text = phoneNumber,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(20.dp))
-                            .background(Color(0xFFFFC100))
-                            .padding(8.dp)
-                    )
-                    IconButton(onClick = {
-                        val updatedList = phoneNumberList.filter { it != phoneNumber }
-                        phoneNumberList.clear()
-                        phoneNumberList.addAll(updatedList)
-                        updateSharedPreferences(phoneNumberList)
-                    }) {
-                        Icon(Icons.Filled.Delete, contentDescription = "Удалить")
-                    }
-                }
-            }
-
-            OutlinedTextField(
-                value = retryCount,
-                onValueChange = { newRetryCount ->
-                    retryCount = newRetryCount
-                    sharedPreferences.edit().putString("retryCount", newRetryCount).apply()
-                },
-                label = { Text("Количество попыток (retry)") },
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-            )
 
             Button(
                 onClick = onClearLogs,
@@ -292,9 +205,6 @@ class MainActivity : ComponentActivity() {
                             it.errorText
                         )
                     }
-                }
-                2 -> retryLogsFlow.map { entries ->
-                    entries.map { UnifiedLogEntry(it.id, it.sender, it.logText, it.timestamp, it.errorText) }
                 }
                 else -> flowOf(emptyList())
             }
@@ -365,15 +275,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-
-    private fun updateSharedPreferences(phoneNumbers: List<String>) {
-        val sharedPrefs = getSharedPreferences("AppSettings", MODE_PRIVATE)
-        with(sharedPrefs.edit()) {
-            putString("phoneNumberList", phoneNumbers.joinToString(","))
-            apply()
-        }
-    }
-
     private fun checkAndRequestPermissions() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) != PackageManager.PERMISSION_GRANTED ||
             ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) {
@@ -396,5 +297,4 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
 }

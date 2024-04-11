@@ -1,0 +1,16 @@
+<configuration>
+
+    <appender name="FILE" class="ch.qos.logback.core.FileAppender">
+        <file>/data/data/com.example.hmautomatik/logs/app.log</file>
+        <append>true</append>
+        <encoder>
+            <pattern>%date - [%level] - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <root level="DEBUG">
+        <appender-ref ref="FILE" />
+    </root>
+
+</configuration>
+
